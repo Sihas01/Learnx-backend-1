@@ -4,6 +4,9 @@ import uuid
 import smtplib
 from contextlib import asynccontextmanager
 from email.message import EmailMessage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,7 +57,45 @@ class ResetPasswordRequest(BaseModel):
 class ResendVerificationRequest(BaseModel):
     email: str
 
-async def send_auth_email(email: str, subject: str, body: str):
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; margin: 0; padding: 0; }}
+        .container {{ max-width: 600px; margin: 20px auto; background: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.1); border: 1px solid #e0e0e0; }}
+        .header {{ background-color: #ffffff; padding: 30px; text-align: center; border-bottom: 2px solid #f0f0f0; }}
+        .content {{ padding: 40px; color: #333333; line-height: 1.6; }}
+        .content h2 {{ color: #2c3e50; margin-top: 0; font-size: 24px; }}
+        .content p {{ font-size: 16px; margin-bottom: 25px; }}
+        .button-container {{ text-align: center; margin-top: 35px; }}
+        .button {{ background: linear-gradient(135deg, #6e8efb, #a777e3); color: #ffffff !important; padding: 14px 32px; text-decoration: none; border-radius: 50px; font-weight: 600; font-size: 16px; display: inline-block; transition: transform 0.2s; box-shadow: 0 4px 15px rgba(110, 142, 251, 0.3); }}
+        .footer {{ background-color: #f9f9f9; padding: 20px; text-align: center; font-size: 13px; color: #888888; border-top: 1px solid #eeeeee; }}
+        .footer p {{ margin: 5px 0; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <img src="cid:logo" alt="learnX Logo" width="160">
+        </div>
+        <div class="content">
+            <h2>{title}</h2>
+            <p>{message}</p>
+            <div class="button-container">
+                <a href="{link}" class="button">{button_text}</a>
+            </div>
+        </div>
+        <div class="footer">
+            <p>&copy; 2026 learnX. All rights reserved.</p>
+            <p>Empowering your learning journey.</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+async def send_auth_email(email: str, subject: str, message_text: str, title: str, button_text: str, link: str):
     smtp_host = os.getenv("SMTP_HOST")
     smtp_port = int(os.getenv("SMTP_PORT", 587))
     smtp_user = os.getenv("SMTP_USER")
@@ -65,11 +106,40 @@ async def send_auth_email(email: str, subject: str, body: str):
         print(f"SMTP Error: Credentials not fully configured in .env for {subject}")
         raise HTTPException(status_code=500, detail="Mail server not configured")
 
-    msg = EmailMessage()
-    msg.set_content(body)
+    msg = MIMEMultipart("related")
     msg["Subject"] = subject
     msg["From"] = smtp_from
     msg["To"] = email
+
+    msg_alternative = MIMEMultipart("alternative")
+    msg.attach(msg_alternative)
+
+    # Plain text version
+    part_text = MIMEText(f"{title}\\n\\n{message_text}\\n\\n{link}", "plain")
+    msg_alternative.attach(part_text)
+
+    # HTML version
+    html_content = HTML_TEMPLATE.format(
+        title=title,
+        message=message_text,
+        button_text=button_text,
+        link=link
+    )
+    part_html = MIMEText(html_content, "html")
+    msg_alternative.attach(part_html)
+
+    # Attach logo as inline image
+    logo_path = os.path.join(os.path.dirname(__file__), "..", "learnX", "public", "logo.png")
+    if os.path.exists(logo_path):
+        try:
+            with open(logo_path, "rb") as f:
+                logo_data = f.read()
+                logo_image = MIMEImage(logo_data)
+                logo_image.add_header("Content-ID", "<logo>")
+                logo_image.add_header("Content-Disposition", "inline", filename="logo.png")
+                msg.attach(logo_image)
+        except Exception as e:
+            print(f"Failed to attach logo: {e}")
 
     try:
         if smtp_port == 465:
@@ -136,7 +206,10 @@ async def register(user: User):
         await send_auth_email(
             user.email, 
             "Verify Your Email", 
-            f"Click the link to verify your email address: {verify_link}"
+            "Thank you for registering with learnX. Please verify your email address to get started.",
+            "Welcome to learnX!",
+            "Verify Email",
+            verify_link
         )
         
         return {"message": "User registered successfully. Please check your email to verify your account."}
@@ -206,7 +279,10 @@ async def resend_verification(req: ResendVerificationRequest):
         await send_auth_email(
             user.email, 
             "Verify Your Email", 
-            f"Click the link to verify your email address: {verify_link}"
+            "You requested a new verification link. Please click the button below to verify your account.",
+            "Verify Your Email",
+            "Verify Email",
+            verify_link
         )
         return {"message": "Verification email resent"}
 
@@ -225,7 +301,14 @@ async def forgot_password(req: ForgotPasswordRequest):
         
         frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
         reset_link = f"{frontend_url}/reset-password?token={token}"
-        await send_auth_email(user.email, "Password Reset", f"Click the link to reset your password: {reset_link}")
+        await send_auth_email(
+            user.email, 
+            "Password Reset", 
+            "We received a request to reset your password. If you didn't make this request, you can safely ignore this email.",
+            "Reset Your Password",
+            "Reset Password",
+            reset_link
+        )
         return {"message": "Reset email sent"}
 
 @app.post("/reset-password")
