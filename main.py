@@ -279,34 +279,51 @@ async def google_login(req: GoogleLoginRequest):
                 last_name = userinfo.get('family_name', '')
         
         async with async_session() as session:
-            # Check if user exists by google_id
+            # 1. Check if user exists by google_id
             result = await session.execute(select(UserDB).where(UserDB.google_id == google_id))
             user = result.scalars().first()
             
             is_new_user = False
-            if not user:
-                # Check if user exists by email (link account)
-                result = await session.execute(select(UserDB).where(UserDB.email == email))
-                user = result.scalars().first()
+            
+            if user:
+                # Existing Google user
+                if req.studentId and not user.studentId:
+                    # Check if requested studentId is already taken by another user
+                    sid_check = await session.execute(select(UserDB).where(UserDB.studentId == req.studentId))
+                    if sid_check.scalars().first():
+                        raise HTTPException(status_code=400, detail="Student ID already registered")
+                    user.studentId = req.studentId
+                    await session.commit()
+            else:
+                # Potential new user or existing email/pass user
+                # 2. Check if user exists by email
+                email_check = await session.execute(select(UserDB).where(UserDB.email == email))
+                existing_email_user = email_check.scalars().first()
                 
-                if user:
-                    user.google_id = google_id
-                    user.is_verified = 1 # Google users are verified
-                    if req.studentId and not user.studentId:
-                        user.studentId = req.studentId
-                else:
-                    is_new_user = True
-                    # Create new user
-                    user = UserDB(
-                        firstName=first_name,
-                        lastName=last_name,
-                        email=email,
-                        google_id=google_id,
-                        studentId=req.studentId,
-                        is_verified=1
+                if existing_email_user:
+                    # Email exists but doesn't have this google_id
+                    raise HTTPException(
+                        status_code=400, 
+                        detail="An account with this email already exists. Please login with your password."
                     )
-                    session.add(user)
                 
+                # 3. Check studentId if provided
+                if req.studentId:
+                    sid_check = await session.execute(select(UserDB).where(UserDB.studentId == req.studentId))
+                    if sid_check.scalars().first():
+                        raise HTTPException(status_code=400, detail="Student ID already registered")
+                
+                # 4. Create new user
+                is_new_user = True
+                user = UserDB(
+                    firstName=first_name,
+                    lastName=last_name,
+                    email=email,
+                    google_id=google_id,
+                    studentId=req.studentId,
+                    is_verified=1 # Google users are verified
+                )
+                session.add(user)
                 await session.commit()
                 await session.refresh(user)
             
@@ -320,6 +337,8 @@ async def google_login(req: GoogleLoginRequest):
                 }
             }
             
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Google Token Verification Error: {e}")
         raise HTTPException(status_code=400, detail="Invalid Google token")
