@@ -375,6 +375,12 @@ async def forgot_password(req: ForgotPasswordRequest):
         if not user:
             raise HTTPException(status_code=404, detail="Email not found")
         
+        if user.google_id:
+            raise HTTPException(
+                status_code=400, 
+                detail="This account is linked with Google. Please use 'Sign in with Google'."
+            )
+        
         token = uuid.uuid4().hex
         user.reset_token = token
         await session.commit()
