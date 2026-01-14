@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 from sqlalchemy import Column, Integer, String, select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
+from google.oauth2 import id_token
+from google.auth.transport import requests
 
 load_dotenv()
 
@@ -30,8 +32,9 @@ class UserDB(Base):
     firstName = Column(String(100))
     lastName = Column(String(100))
     email = Column(String(255), unique=True)
-    studentId = Column(String(50), unique=True)
-    password = Column(String(255))
+    studentId = Column(String(50), unique=True, nullable=True)
+    password = Column(String(255), nullable=True)
+    google_id = Column(String(255), unique=True, nullable=True)
     reset_token = Column(String(255), nullable=True)
     is_verified = Column(Integer, default=0)  
     verification_token = Column(String(255), nullable=True)
@@ -56,6 +59,10 @@ class ResetPasswordRequest(BaseModel):
 
 class ResendVerificationRequest(BaseModel):
     email: str
+
+class GoogleLoginRequest(BaseModel):
+    token: str
+    studentId: str = None
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -244,6 +251,98 @@ async def login(user_login: UserLogin):
         
     raise HTTPException(status_code=401, detail="Invalid student ID or password")
 
+@app.post("/google-login")
+async def google_login(req: GoogleLoginRequest):
+    try:
+        # First try to verify as ID token
+        client_id = os.getenv("GOOGLE_CLIENT_ID")
+        try:
+            idinfo = id_token.verify_oauth2_token(req.token, requests.Request(), client_id)
+            email = idinfo['email']
+            google_id = idinfo['sub']
+            first_name = idinfo.get('given_name', '')
+            last_name = idinfo.get('family_name', '')
+        except Exception:
+            # If ID token verification fails, try as access token by fetching user info
+            import httpx
+            async with httpx.AsyncClient() as client:
+                res = await client.get(
+                    "https://www.googleapis.com/oauth2/v3/userinfo",
+                    headers={"Authorization": f"Bearer {req.token}"}
+                )
+                if res.status_code != 200:
+                    raise HTTPException(status_code=400, detail="Invalid Google token")
+                userinfo = res.json()
+                email = userinfo['email']
+                google_id = userinfo['sub']
+                first_name = userinfo.get('given_name', '')
+                last_name = userinfo.get('family_name', '')
+        
+        async with async_session() as session:
+            # 1. Check if user exists by google_id
+            result = await session.execute(select(UserDB).where(UserDB.google_id == google_id))
+            user = result.scalars().first()
+            
+            is_new_user = False
+            
+            if user:
+                # Existing Google user
+                if req.studentId and not user.studentId:
+                    # Check if requested studentId is already taken by another user
+                    sid_check = await session.execute(select(UserDB).where(UserDB.studentId == req.studentId))
+                    if sid_check.scalars().first():
+                        raise HTTPException(status_code=400, detail="Student ID already registered")
+                    user.studentId = req.studentId
+                    await session.commit()
+            else:
+                # Potential new user or existing email/pass user
+                # 2. Check if user exists by email
+                email_check = await session.execute(select(UserDB).where(UserDB.email == email))
+                existing_email_user = email_check.scalars().first()
+                
+                if existing_email_user:
+                    # Email exists but doesn't have this google_id
+                    raise HTTPException(
+                        status_code=400, 
+                        detail="An account with this email already exists. Please login with your password."
+                    )
+                
+                # 3. Check studentId if provided
+                if req.studentId:
+                    sid_check = await session.execute(select(UserDB).where(UserDB.studentId == req.studentId))
+                    if sid_check.scalars().first():
+                        raise HTTPException(status_code=400, detail="Student ID already registered")
+                
+                # 4. Create new user
+                is_new_user = True
+                user = UserDB(
+                    firstName=first_name,
+                    lastName=last_name,
+                    email=email,
+                    google_id=google_id,
+                    studentId=req.studentId,
+                    is_verified=1 # Google users are verified
+                )
+                session.add(user)
+                await session.commit()
+                await session.refresh(user)
+            
+            return {
+                "message": "Login successful",
+                "is_new_user": is_new_user,
+                "user": {
+                    "firstName": user.firstName,
+                    "lastName": user.lastName,
+                    "studentId": user.studentId or "Google User"
+                }
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Google Token Verification Error: {e}")
+        raise HTTPException(status_code=400, detail="Invalid Google token")
+
 @app.get("/verify-email")
 async def verify_email(token: str):
     async with async_session() as session:
@@ -294,6 +393,12 @@ async def forgot_password(req: ForgotPasswordRequest):
         
         if not user:
             raise HTTPException(status_code=404, detail="Email not found")
+        
+        if user.google_id:
+            raise HTTPException(
+                status_code=400, 
+                detail="This account is linked with Google. Please use 'Sign in with Google'."
+            )
         
         token = uuid.uuid4().hex
         user.reset_token = token

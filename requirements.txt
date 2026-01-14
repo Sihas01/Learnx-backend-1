@@ -10,3 +10,6 @@ passlib[bcrypt]
 python-multipart
 email-validator
 cryptography
+google-auth
+requests
+httpx
